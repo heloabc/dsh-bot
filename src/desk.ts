@@ -1,0 +1,496 @@
+/** Workbench routes inside the DSH process. The browser calls /dsh-bot/api. */
+
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { openLedger, validIdempotencyKey } from './desk-ledger.ts'
+import { openSessionPreviews } from './session-previews.ts'
+import { purgeSessionFiles, sessionDirectory, writeBotMarker } from './session-files.ts'
+
+const API = '/session-foundations/api'
+const PREVIEW_SESSION = /^(?:session|worker)-[A-Za-z0-9-]+$/
+const SECRET_KEY = /token|secret|password|authorization|api[-_]?key|cookie/i
+
+/**
+ * @param {object} options
+ * @param {string} options.ledgerFile
+ * @param {string} options.profileDir
+ * @param {string} options.sessionCwd
+ * @param {(sessionId: string) => boolean} options.isBot
+ * @param {(sessionId: string) => { kind?: string } | null | undefined} options.mark
+ * @param {(sessionId: string) => void | Promise<void>} options.hold
+ * @param {(sessionId: string) => void | Promise<void>} options.release
+ * @param {(endpoint: string, args: Record<string, unknown>, req: import('node:http').IncomingMessage) => Promise<{ status: number, body: RpcEnvelope }>} options.rpc
+ * @param {(req: import('node:http').IncomingMessage) => Promise<Record<string, unknown>>} options.usage
+ */
+export function createDesk(options) {
+  const ledger = openLedger(options.ledgerFile)
+  const sessionPreviews = openSessionPreviews(join(dirname(options.ledgerFile), 'session-previews.json'))
+  /** @type {Map<string, Promise<void>>} */
+  const promptLocks = new Map()
+  const sessionsRoot = join(options.profileDir, 'sessions')
+
+  return {
+    /**
+     * @param {string} method
+     * @param {string} path
+     */
+    owns(method, path) {
+      const sub = subpath(path)
+      if (sub === null) return false
+      if (method === 'GET' && (sub === '/health' || sub === '/sessions' || sub === '/tasks' || sub === '/usage' || sub === '/file')) return true
+      if (method === 'POST' && (sub === '/sessions' || sub === '/sessions/previews' || sub === '/tasks')) return true
+      if (method === 'POST' && /^\/sessions\/session-[A-Za-z0-9-]+\/(?:archive|purge)$/.test(sub)) return true
+      if (method === 'POST' && /^\/tasks\/[0-9a-f-]{36}\/cancel$/.test(sub)) return true
+      return false
+    },
+    /**
+     * @param {string} method
+     * @param {string} path
+     * @param {URL} url
+     * @param {import('node:http').IncomingMessage} req
+     */
+    async handle(method, path, url, req) {
+      const sub = subpath(path) ?? ''
+      const body = method === 'POST' ? await readJson(req) : {}
+      if (method === 'GET' && sub === '/health') return { status: 200, body: await health(req) }
+      if (method === 'GET' && sub === '/sessions') {
+        const result = await options.rpc('session/list', { _request: {} }, req)
+        return { status: result.status, body: attachPreviews(result.body) }
+      }
+      if (method === 'POST' && sub === '/sessions/previews') return savePreviews(body)
+      if (method === 'POST' && sub === '/sessions') return createSession(req, body)
+      const archive = sub.match(/^\/sessions\/(session-[A-Za-z0-9-]+)\/archive$/)
+      if (method === 'POST' && archive) return archiveBlank(req, archive[1])
+      const purge = sub.match(/^\/sessions\/(session-[A-Za-z0-9-]+)\/purge$/)
+      if (method === 'POST' && purge) return purgeBlank(req, purge[1])
+      if (method === 'GET' && sub === '/tasks') return { status: 200, body: { items: ledger.tasks() } }
+      if (method === 'POST' && sub === '/tasks') return createTask(req, body)
+      const cancel = sub.match(/^\/tasks\/([0-9a-f-]{36})\/cancel$/)
+      if (method === 'POST' && cancel) return cancelTask(req, cancel[1])
+      if (method === 'GET' && sub === '/usage') return { status: 200, body: redactSecrets(await options.usage(req)) }
+      if (method === 'GET' && sub === '/file') return filePreview(req, url)
+      return { status: 404, body: { error: 'not_found' } }
+    },
+  }
+
+  /**
+   * @param {import('node:http').IncomingMessage} req
+   */
+  async function health(req) {
+    const execution = await executionState(req)
+    return {
+      primary: { reachable: execution.reachable },
+      execution: { ready: execution.ready, reason: execution.reason },
+    }
+  }
+
+  /**
+   * @param {import('node:http').IncomingMessage} req
+   */
+  async function executionState(req) {
+    const catalog = await options.rpc('session/modelCatalog', {}, req)
+    const value = catalog.body?.result?.value
+    const routable = Array.isArray(value?.routableProviders) ? value.routableProviders : []
+    if (catalog.body?.result?.ok === true && routable.length > 0) return { ready: true, reason: '', reachable: true }
+    const failure = catalog.body?.result?.error?.message
+    return {
+      ready: false,
+      reason: catalog.body?.result?.ok === true ? 'no_provider' : (failure ? String(failure) : 'catalog_unreadable'),
+      reachable: catalog.status > 0 && catalog.status < 500,
+    }
+  }
+
+  /**
+   * @param {import('node:http').IncomingMessage} req
+   * @param {Record<string, unknown>} body
+   */
+  async function createSession(req, body) {
+    const key = idempotencyOf(req, body)
+    if (!validIdempotencyKey(key)) return { status: 400, body: { error: 'idempotency_key_required' } }
+    const existing = ledger.session(key)
+    if (existing) return { status: 200, body: { sessionId: existing.sessionId, reused: true } }
+    const listed = await options.rpc('session/list', { _request: {} }, req)
+    const known = listed.body?.result?.ok === true && Array.isArray(listed.body.result.value?.items)
+      ? listed.body.result.value.items
+      : []
+    const reusable = options.sessionCwd === ''
+      ? undefined
+      : known.find(item => item?.blank === true && item?.running !== true && item?.cwd === options.sessionCwd && typeof item.sessionId === 'string')
+    const request = options.sessionCwd === ''
+      ? {}
+      : reusable
+        ? { cwd: options.sessionCwd, sessionId: reusable.sessionId }
+        : { cwd: options.sessionCwd }
+    const created = await options.rpc('session/create', { request }, req)
+    const sessionId = created.body?.result?.value?.sessionId
+    if (created.body?.result?.ok !== true || typeof sessionId !== 'string') {
+      return { status: 502, body: { error: 'session_create_failed', upstream: created.body?.result?.error ?? null } }
+    }
+    const marked = options.mark(sessionId)
+    if (!marked || marked.kind !== 'bot') {
+      return { status: 502, body: { error: 'bot_mark_failed', sessionId, upstream: marked ?? null } }
+    }
+    let marker = ''
+    if (options.sessionCwd !== '') {
+      try {
+        marker = writeBotMarker({
+          sessionsRoot,
+          cwd: options.sessionCwd,
+          sessionId,
+          name: typeof body.name === 'string' ? body.name : '',
+        })
+      } catch {
+        return { status: 502, body: { error: 'bot_marker_failed', sessionId } }
+      }
+    }
+    ledger.rememberSession(key, sessionId)
+    return { status: 201, body: { sessionId, kind: 'bot', marker, reused: Boolean(reusable) && sessionId === reusable.sessionId } }
+  }
+
+  /**
+   * @param {import('node:http').IncomingMessage} req
+   * @param {string} sessionId
+   */
+  async function archiveBlank(req, sessionId) {
+    const listed = await options.rpc('session/list', { _request: {} }, req)
+    const items = listed.body?.result?.value?.items
+    if (listed.body?.result?.ok !== true || !Array.isArray(items)) {
+      return { status: 502, body: { error: 'session_list_failed', upstream: listed.body?.result?.error ?? null } }
+    }
+    const item = items.find(entry => entry?.sessionId === sessionId)
+    if (!item) return { status: 404, body: { error: 'session_not_found' } }
+    if (item.blank !== true || item.running === true) return { status: 409, body: { error: 'not_blank' } }
+    const archived = await options.rpc('workspace/archiveSession', { request: { sessionId } }, req)
+    const archivedSessionIds = archived.body?.result?.value?.archivedSessionIds
+    if (archived.body?.result?.ok !== true || !Array.isArray(archivedSessionIds)) {
+      return { status: 502, body: { error: 'archive_failed', upstream: archived.body?.result?.error ?? null } }
+    }
+    return { status: 200, body: { sessionId, archivedSessionIds } }
+  }
+
+  /**
+   * @param {import('node:http').IncomingMessage} req
+   * @param {string} sessionId
+   */
+  async function purgeBlank(req, sessionId) {
+    const listed = await options.rpc('session/list', { _request: {} }, req)
+    const items = listed.body?.result?.value?.items
+    if (listed.body?.result?.ok !== true || !Array.isArray(items)) {
+      return { status: 502, body: { error: 'session_list_failed', upstream: listed.body?.result?.error ?? null } }
+    }
+    const item = items.find(entry => entry?.sessionId === sessionId)
+    if (!item) return { status: 404, body: { error: 'session_not_found' } }
+    if (item.blank !== true || item.running === true || typeof item.cwd !== 'string' || item.cwd === '') {
+      return { status: 409, body: { error: 'not_blank' } }
+    }
+    try {
+      purgeSessionFiles({
+        sessionsRoot,
+        cacheFile: join(options.profileDir, 'storages', 'session_projcache', 'sessions', `${sessionId}.json`),
+        workspaceFile: join(options.profileDir, 'storages', 'workspace.json'),
+        sessionId,
+        cwd: item.cwd,
+      })
+    } catch (error) {
+      return { status: 500, body: { error: 'purge_failed', message: error instanceof Error ? error.message : 'purge failed' } }
+    }
+    sessionPreviews.forget(sessionId)
+    return { status: 200, body: { sessionId, purged: true } }
+  }
+
+  /**
+   * @param {unknown} body
+   */
+  function attachPreviews(body) {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return body
+    return { ...body, previews: sessionPreviews.all() }
+  }
+
+  /**
+   * @param {Record<string, unknown>} body
+   */
+  function savePreviews(body) {
+    if (body.previews && typeof body.previews === 'object' && !Array.isArray(body.previews)) {
+      sessionPreviews.rememberAll(body.previews)
+      return { status: 200, body: { ok: true, previews: sessionPreviews.all() } }
+    }
+    const saved = sessionPreviews.remember(body.sessionId, body.preview)
+    if (!saved.ok) return { status: 400, body: { error: saved.error } }
+    return { status: 200, body: { ok: true, preview: saved.preview } }
+  }
+
+  /**
+   * @param {import('node:http').IncomingMessage} req
+   * @param {Record<string, unknown>} body
+   */
+  async function createTask(req, body) {
+    const key = idempotencyOf(req, body)
+    if (!validIdempotencyKey(key)) return { status: 400, body: { error: 'idempotency_key_required' } }
+    const text = typeof body.text === 'string' ? body.text : ''
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+    if (text.trim() === '' || text.length > 8000 || !/^session-[A-Za-z0-9-]+$/.test(sessionId)) {
+      return { status: 400, body: { error: 'invalid_task' } }
+    }
+    const execution = await executionState(req)
+    const remembered = ledger.rememberTask(key, {
+      sessionId,
+      status: execution.ready ? 'accepted' : 'blocked_unconfigured',
+      reason: execution.ready ? '' : execution.reason,
+    })
+    if (!remembered.created) return { status: 200, body: { task: remembered.record, reused: true } }
+    if (!execution.ready) {
+      return { status: 409, body: { error: 'model_unconfigured', task: remembered.record, execution: { ready: false, reason: execution.reason } } }
+    }
+    const delivered = await withPromptLock(sessionId, () => deliverPrompt(req, sessionId, text, remembered.record.id))
+    if (!delivered.ok) {
+      const updated = ledger.updateTask(remembered.record.id, {
+        status: 'failed',
+        reason: delivered.reason,
+        upstreamCode: delivered.upstreamCode,
+      })
+      return { status: delivered.status, body: { error: delivered.error, task: updated } }
+    }
+    return { status: 202, body: { task: remembered.record, reused: false, interrupted: delivered.interrupted } }
+  }
+
+  /**
+   * @param {import('node:http').IncomingMessage} req
+   * @param {string} id
+   */
+  async function cancelTask(req, id) {
+    const task = ledger.task(id)
+    if (!task) return { status: 404, body: { error: 'not_found' } }
+    if (task.status !== 'accepted') return { status: 409, body: { error: 'not_running', task } }
+    const result = await options.rpc('session/cancel', { request: { sessionId: task.sessionId } }, req)
+    const updated = ledger.updateTask(task.id, {
+      status: result.body?.result?.ok === true ? 'cancelled' : 'failed',
+      reason: result.body?.result?.ok === true ? '' : (result.body?.result?.error?.message ?? 'cancel failed'),
+      upstreamCode: result.body?.result?.error?.code,
+    })
+    return { status: result.body?.result?.ok === true ? 200 : 502, body: { task: updated } }
+  }
+
+  /**
+   * @param {import('node:http').IncomingMessage} req
+   * @param {URL} url
+   */
+  async function filePreview(req, url) {
+    const sessionId = url.searchParams.get('sessionId') ?? ''
+    const filePath = workspaceRelativePath(url.searchParams.get('path') ?? '')
+    if (!PREVIEW_SESSION.test(sessionId) || filePath === null) return { status: 400, body: { error: 'invalid_file' } }
+    const result = await options.rpc('workspaceFiles/read', {
+      workspaceFileScopeId: sessionId,
+      path: filePath,
+      range: { offset: 1, limit: 2000 },
+    }, req)
+    const value = result.body?.result?.value
+    if (result.body?.result?.ok !== true || !value || typeof value.text !== 'string') {
+      const code = result.body?.result?.error?.code
+      return {
+        status: result.status === 401 ? 401 : 404,
+        body: { error: 'file_unreadable', code: typeof code === 'string' ? code : 'workspace-file/not-found' },
+      }
+    }
+    return {
+      status: 200,
+      body: {
+        path: filePath,
+        name: filePath.split('/').at(-1) ?? filePath,
+        text: value.text,
+        eof: value.eof === true,
+        bytes: typeof value.bytes === 'number' ? value.bytes : null,
+      },
+    }
+  }
+
+  /**
+   * @param {string} sessionId
+   * @param {() => Promise<T>} fn
+   * @template T
+   */
+  async function withPromptLock(sessionId, fn) {
+    const previous = promptLocks.get(sessionId) ?? Promise.resolve()
+    let release = () => {}
+    const gate = new Promise(resolve => {
+      release = () => resolve(undefined)
+    })
+    const tail = previous.then(() => gate)
+    promptLocks.set(sessionId, tail)
+    await previous
+    try {
+      return await fn()
+    } finally {
+      release()
+      if (promptLocks.get(sessionId) === tail) promptLocks.delete(sessionId)
+    }
+  }
+
+  /**
+   * @param {string} sessionId
+   */
+  function botMarked(sessionId) {
+    if (options.sessionCwd === '') return false
+    try {
+      const file = join(sessionDirectory(sessionsRoot, options.sessionCwd, sessionId), 'bot.json')
+      const parsed = JSON.parse(readFileSync(file, 'utf8'))
+      return parsed?.kind === 'bot' && parsed?.sessionId === sessionId
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * @param {import('node:http').IncomingMessage} req
+   * @param {string} sessionId
+   * @returns {Promise<boolean | null>}
+   */
+  async function sessionRunning(req, sessionId) {
+    const listed = await options.rpc('session/list', { _request: {} }, req)
+    if (listed.body?.result?.ok !== true || !Array.isArray(listed.body.result.value?.items)) return null
+    const item = listed.body.result.value.items.find(entry => entry?.sessionId === sessionId)
+    return item?.running === true
+  }
+
+  /**
+   * Idle sessions queue. A live bot turn is cancelled, then the new text is a new turn.
+   * The cancel is only the main session. Worker sessions are not addressed here.
+   * @param {import('node:http').IncomingMessage} req
+   * @param {string} sessionId
+   * @param {string} text
+   * @param {string} requestId
+   */
+  async function deliverPrompt(req, sessionId, text, requestId) {
+    const running = await sessionRunning(req, sessionId)
+    if (running === null) {
+      return { ok: false, status: 502, error: 'session_unreadable', reason: 'Could not tell whether the session is still running.', upstreamCode: '' }
+    }
+    let interrupted = false
+    if (running && (options.isBot(sessionId) || botMarked(sessionId))) {
+      interrupted = true
+      await options.hold(sessionId)
+      const cancelled = await options.rpc('session/cancel', { request: { sessionId } }, req)
+      if (cancelled.body?.result?.ok !== true) {
+        await options.release(sessionId)
+        return {
+          ok: false,
+          status: 502,
+          error: 'cancel_failed',
+          reason: cancelled.body?.result?.error?.message ?? 'cancel failed',
+          upstreamCode: cancelled.body?.result?.error?.code ?? '',
+        }
+      }
+      for (const task of ledger.tasks()) {
+        if (task.sessionId === sessionId && task.status === 'accepted' && task.id !== requestId) {
+          ledger.updateTask(task.id, { status: 'cancelled', reason: 'interrupted' })
+        }
+      }
+    }
+    const prompted = await options.rpc('session/prompt', {
+      request: { requestId, sessionId, mode: 'queue', content: [{ type: 'text', text }] },
+    }, req)
+    if (prompted.body?.result?.ok !== true) {
+      if (interrupted) await options.release(sessionId)
+      return {
+        ok: false,
+        status: 502,
+        error: 'prompt_failed',
+        reason: prompted.body?.result?.error?.message ?? 'prompt failed',
+        upstreamCode: prompted.body?.result?.error?.code ?? '',
+      }
+    }
+    return { ok: true, interrupted }
+  }
+}
+
+/**
+ * @param {string} path
+ */
+function subpath(path) {
+  if (path === API) return '/'
+  if (!path.startsWith(`${API}/`)) return null
+  return path.slice(API.length)
+}
+
+/**
+ * @param {import('node:http').IncomingMessage} req
+ * @param {Record<string, unknown>} body
+ */
+function idempotencyOf(req, body) {
+  const value = req.headers['idempotency-key']
+  const header = typeof value === 'string' ? value : ''
+  if (header !== '') return header
+  return typeof body.idempotencyKey === 'string' ? body.idempotencyKey : ''
+}
+
+/**
+ * Keep a preview path inside a session workspace: relative, no parent segments.
+ * @param {string} value
+ * @returns {string | null}
+ */
+function workspaceRelativePath(value) {
+  if (value.length === 0 || value.length > 512 || /[\u0000-\u001f\\?#]/.test(value)) return null
+  if (value.startsWith('/') || /^[a-zA-Z]:/.test(value)) return null
+  const parts = []
+  for (const part of value.split('/')) {
+    if (part === '' || part === '.') continue
+    if (part === '..') return null
+    parts.push(part)
+  }
+  return parts.length === 0 ? null : parts.join('/')
+}
+
+/**
+ * @param {unknown} value
+ * @returns {any}
+ */
+function redactSecrets(value) {
+  if (Array.isArray(value)) return value.map(redactSecrets)
+  if (value !== null && typeof value === 'object') {
+    /** @type {Record<string, unknown>} */
+    const out = {}
+    for (const [key, inner] of Object.entries(value)) {
+      if (SECRET_KEY.test(key)) continue
+      out[key] = redactSecrets(inner)
+    }
+    return out
+  }
+  return value
+}
+
+/**
+ * @param {import('node:http').IncomingMessage} req
+ * @returns {Promise<Record<string, unknown>>}
+ */
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    let size = 0
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > 32_768) {
+        reject(Object.assign(new Error('body too large'), { code: 'VALIDATION' }))
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      if (chunks.length === 0) {
+        resolve({})
+        return
+      }
+      try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+        resolve(parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {})
+      } catch (error) {
+        reject(Object.assign(error instanceof Error ? error : new Error('invalid json'), { code: 'VALIDATION' }))
+      }
+    })
+    req.on('error', reject)
+  })
+}
+
+/**
+ * @typedef {object} RpcEnvelope
+ * @property {{ ok?: boolean, value?: any, error?: { message?: string, code?: string } }} [result]
+ */
