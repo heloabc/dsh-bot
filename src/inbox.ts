@@ -1,0 +1,191 @@
+/**
+ * Host adapter over the native DSH inbox. The durable pending queue is
+ * agent.followup(), which appends agent/inbox/spliced and wakes a later turn.
+ * This module does not keep a second execution queue.
+ */
+
+import { workerFileSetup } from './work-child.ts'
+
+const handles = new Map()
+const loading = new Map()
+
+/**
+ * An agent already entered in this process. Reading must not call `resume`:
+ * resume announces `session/created`, and disposing that handle announces
+ * `session/disposed`, which the native session list treats as removal.
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {string} sessionId
+ */
+export function liveAgent(ctx, sessionId) {
+  try {
+    const live = ctx.agents?.get?.(sessionId)
+    if (live) return live
+  } catch {
+    /* not entered */
+  }
+  return handles.get(sessionId)?.agent ?? null
+}
+
+/**
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {string} sessionId
+ */
+export async function loadAgent(ctx, sessionId) {
+  const live = ctx.agents.get(sessionId)
+  if (live) return { agent: live, owned: false }
+  const owned = handles.get(sessionId)
+  if (owned) return { agent: owned.agent, owned: true }
+  const pending = loading.get(sessionId)
+  if (pending) return pending
+  const job = ctx.agents.resume({
+    resumeSessionId: sessionId,
+    ...sessionId.startsWith('worker-') ? { setup: workerFileSetup(ctx, null) } : {},
+  }).then(handle => {
+    handles.set(sessionId, handle)
+    loading.delete(sessionId)
+    return { agent: handle.agent, owned: true }
+  }).catch(error => {
+    loading.delete(sessionId)
+    throw error
+  })
+  loading.set(sessionId, job)
+  return job
+}
+
+/**
+ * Follow-up into the native next-turn inbox, then flush. Flush failure does
+ * not by itself mean the append is durable. session/event is not the boundary.
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {string} sessionId
+ * @param {string} messageId
+ * @param {string} text
+ */
+export async function followupDurable(ctx, sessionId, messageId, text) {
+  if (process.env.SESSION_FOUNDATIONS_CRASH_BEFORE_FLUSH === '1') {
+    const loaded = await loadAgent(ctx, sessionId)
+    loaded.agent.followup(userMessage(messageId, text))
+    process.exit(97)
+  }
+  const loaded = await loadAgent(ctx, sessionId)
+  const agent = loaded.agent
+  try {
+    agent.followup(userMessage(messageId, text))
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (!message.includes('already pending')) throw error
+  }
+  const seq = spliceSeq(agent.session, messageId)
+  let flushed = false
+  let flushError = ''
+  try {
+    flushed = await ctx.sessions.flush(agent.session) === true
+  } catch (error) {
+    flushError = error instanceof Error ? error.message : String(error)
+  }
+  return {
+    ok: flushed && seq != null,
+    ambiguous: !flushed,
+    seq,
+    error: flushError,
+    target: 'next-turn',
+    wakeup: true,
+  }
+}
+
+/**
+ * @param {{ snapshotEvents?: () => Array<{ type?: string, seq?: number, data?: { inserted?: Array<{ id?: string }> } }> }} session
+ * @param {string} messageId
+ */
+export function logHasMessage(session, messageId) {
+  const events = session.snapshotEvents?.() ?? []
+  return events.some(event => event.type === 'agent/inbox/spliced' && insertedIds(event).includes(messageId))
+    || events.some(event => event.type === 'user/message' && messageIdOf(event) === messageId)
+}
+
+/**
+ * Live snapshot when the agent is already entered. Otherwise a read-only
+ * stored log, which does not enter the session or take the write claim.
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {string} sessionId
+ * @returns {Promise<Array<{ type?: string, seq?: number, data?: { id?: string, message?: { id?: string }, inserted?: Array<{ id?: string }> } }>>}
+ */
+export async function sessionEvents(ctx, sessionId) {
+  const agent = liveAgent(ctx, sessionId)
+  if (agent?.session?.snapshotEvents) return agent.session.snapshotEvents()
+  const persistence = ctx.sessionPersistence
+  if (!persistence?.open) throw new Error('session log is not readable')
+  /** @type {{ read?: () => Promise<{ events?: unknown[] }>, close?: () => Promise<void> } | undefined} */
+  let handle
+  try {
+    handle = await persistence.open(sessionId, 'read')
+    const page = typeof handle?.read === 'function' ? await handle.read() : { events: [] }
+    return Array.isArray(page?.events) ? page.events : []
+  } catch (error) {
+    if (missingSession(error)) return []
+    throw error
+  } finally {
+    await handle?.close?.().catch(() => {})
+  }
+}
+
+/**
+ * @param {unknown} error
+ */
+function missingSession(error) {
+  const name = error instanceof Error ? error.name : ''
+  return name === 'SessionPersistenceNotFoundError' || name === 'SessionNotFoundError'
+}
+
+/**
+ * @param {{ snapshotEvents?: () => Array<{ type?: string, seq?: number, data?: { inserted?: Array<{ id?: string }> } }> }} session
+ * @param {string} messageId
+ */
+export function spliceSeq(session, messageId) {
+  const events = session.snapshotEvents?.() ?? []
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event.type === 'agent/inbox/spliced' && insertedIds(event).includes(messageId)) return event.seq ?? null
+  }
+  return null
+}
+
+/**
+ * Drop a still-pending native inbox item. Claimed messages are left alone.
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {string} sessionId
+ * @param {string} messageId
+ */
+export async function removePending(ctx, sessionId, messageId) {
+  const live = ctx.agents.get(sessionId) ?? handles.get(sessionId)?.agent
+  if (!live?.inbox?.remove) return false
+  return live.inbox.remove(messageId) === true
+}
+
+/**
+ * @param {string} messageId
+ * @param {string} text
+ */
+export function userMessage(messageId, text) {
+  return Object.freeze({
+    id: messageId,
+    role: 'user',
+    content: Object.freeze([Object.freeze({ type: 'text', text })]),
+    source: Object.freeze({ kind: 'user' }),
+  })
+}
+
+/**
+ * @param {{ data?: { inserted?: Array<{ id?: string }> } }} event
+ */
+function insertedIds(event) {
+  const inserted = event.data?.inserted
+  if (!Array.isArray(inserted)) return []
+  return inserted.map(message => message?.id).filter(id => typeof id === 'string')
+}
+
+/**
+ * @param {{ data?: { id?: string, message?: { id?: string } } }} event
+ */
+function messageIdOf(event) {
+  return event.data?.id ?? event.data?.message?.id ?? ''
+}
