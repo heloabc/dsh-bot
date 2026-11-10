@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/thready-x/dsh-bot.git"
+    "url": "git+https://github.com/thready-web/dsh-bot.git"
   },
   "bin": {
     "dsh-bot": "./dist/cli.js"

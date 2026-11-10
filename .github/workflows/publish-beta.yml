@@ -10,13 +10,16 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
+  packages: write
+  id-token: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
+      packages: write
       id-token: write
     steps:
       - uses: actions/checkout@v4
@@ -65,3 +68,17 @@ jobs:
             node .github/next-beta-version.mjs --bump
           done
           exit 1
+
+      - name: Publish the GitHub package and release
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s\n' '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' >> .npmrc
+          npm pkg set publishConfig.access=restricted
+          npm publish --registry https://npm.pkg.github.com --access restricted
+          version=$(node --input-type=module -e "import {readFileSync} from 'node:fs'; process.stdout.write(JSON.parse(readFileSync('package.json','utf8')).version)")
+          gh release create "v${version}" \
+            --title "v${version}" \
+            --notes "Beta published to npm as \`@thready-web/dsh-bot@${version}\`." \
+            --prerelease
