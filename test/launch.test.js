@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { defaultHome, planStart, renderPatch, route } from '../lib/launch.js'
+import { checkWorkBudget, defaultHome, planStart, renderPatch, route } from '../lib/launch.js'
 
 test('no args and start launch the host', () => {
   assert.equal(route([]).kind, 'start')
@@ -99,4 +99,50 @@ test('a missing workbench build is reported and does not start', () => {
   assert.equal(plan.ok, false)
   assert.match(plan.message, /public\/index\.html/)
   assert.match(plan.message, /dsh-bot-plugin\/ui/)
+})
+
+function readyTree() {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-bot-'))
+  const pluginRoot = join(dir, 'plugin')
+  mkdirSync(join(pluginRoot, 'dist'), { recursive: true })
+  mkdirSync(join(pluginRoot, 'public'), { recursive: true })
+  for (const file of ['dist/router-plugin.js', 'dist/index.js', 'dist/http-plugin.js', 'public/index.html']) {
+    writeFileSync(join(pluginRoot, file), '')
+  }
+  const dshBin = join(dir, 'bin.js')
+  writeFileSync(dshBin, '')
+  return { dir, pluginRoot, dshBin }
+}
+
+test('sessions and DSH start in <home>/workspace, not in DSH_HOME', () => {
+  const { pluginRoot, dshBin } = readyTree()
+  const base = { pluginRoot, dshBin, nodePath: process.execPath, nodeVersion: '24.9.0' }
+  const plan = planStart({ ...base, argv: ['--home', '/srv/bot'], env: {} })
+  assert.equal(plan.ok, true)
+  assert.equal(plan.workspace, '/srv/bot/workspace')
+  assert.notEqual(plan.workspace, plan.home)
+  assert.equal(plan.env.THREADY_SESSION_CWD, '/srv/bot/workspace')
+  assert.equal(planStart({ ...base, argv: ['--home', '/srv/bot'], env: { THREADY_SESSION_CWD: '/data/ws' } }).workspace, '/data/ws')
+  assert.equal(
+    planStart({ ...base, argv: ['--home', '/srv/bot', '--workspace', '/w'], env: { THREADY_SESSION_CWD: '/data/ws' } }).workspace,
+    '/w',
+  )
+})
+
+test('--work-budget is checked and passed to the plugin through DSH_BOT_WORK_BUDGET', () => {
+  const { pluginRoot, dshBin } = readyTree()
+  const base = { pluginRoot, dshBin, nodePath: process.execPath, nodeVersion: '24.9.0', env: {} }
+  assert.equal(planStart({ ...base, argv: [] }).env.DSH_BOT_WORK_BUDGET, undefined)
+  const plan = planStart({ ...base, argv: ['--work-budget', 'steps=120,wall=45m,mainMaxSteps=10'] })
+  assert.equal(plan.ok, true)
+  assert.equal(plan.env.DSH_BOT_WORK_BUDGET, 'steps=120,wall=45m,mainMaxSteps=10')
+  const json = planStart({ ...base, argv: ['--work-budget={"chatWallMs":"2h"}'] })
+  assert.equal(json.env.DSH_BOT_WORK_BUDGET, '{"chatWallMs":"2h"}')
+  assert.equal(planStart({ ...base, env: { DSH_BOT_WORK_BUDGET: 'steps=50' }, argv: [] }).env.DSH_BOT_WORK_BUDGET, 'steps=50')
+  for (const bad of ['steps=0', 'wall=soon', 'bogus=1', 'steps', '{oops']) {
+    const refused = planStart({ ...base, argv: ['--work-budget', bad] })
+    assert.equal(refused.ok, false, bad)
+    assert.match(refused.message, /--work-budget/)
+  }
+  assert.equal(checkWorkBudget('steps=80,wall=30m').ok, true)
 })

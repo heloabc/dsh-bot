@@ -23,6 +23,10 @@ The host listens on `127.0.0.1:8787`. The log prints a URL that contains `?token
 
 `DSH_PORT` and `DSH_PROFILE` override the defaults. A flag (`--port`, `--profile`, `--host`, `--home`) overrides the matching variable.
 
+Sessions and the DSH process start in `--workspace` (or `THREADY_SESSION_CWD`), which defaults to `DSH_HOME/workspace`. They never start in `DSH_HOME` itself, which holds the owner token and profiles.
+
+`--work-budget` (or `DSH_BOT_WORK_BUDGET`) sets the bot main-session budget. The default is `steps=80,wall=30m`. Example: `dsh-bot start --work-budget steps=120,wall=45m`. Over budget, the plugin refuses the next step instead of cancelling one that already ended, logs the trip to stderr, and posts a `[foundations:budget]` note so the bot tells you and can hand the rest to a worker. The plugin README lists every key.
+
 ```bash
 dsh-bot persona show --data-dir ~/.dsh-bot/profiles/web/session-foundations
 dsh-bot memory list --data-dir ~/.dsh-bot/profiles/web/session-foundations --session ID

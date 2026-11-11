@@ -23,6 +23,10 @@ dsh-bot
 
 `DSH_PORT` 和 `DSH_PROFILE` 覆盖默认值。标志（`--port`、`--profile`、`--host`、`--home`）覆盖对应的环境变量。
 
+会话和 DSH 进程的工作目录是 `--workspace`（或 `THREADY_SESSION_CWD`），默认 `DSH_HOME/workspace`，不会落在存放 owner token 和 profile 的 `DSH_HOME` 本身。
+
+`--work-budget`（或 `DSH_BOT_WORK_BUDGET`）设置 bot 主会话预算，默认 `steps=80,wall=30m`，例如 `dsh-bot start --work-budget steps=120,wall=45m`。超出预算时，插件在下一步开始前拦下，而不是取消已经结束的那一步；同时把这次触发写到 stderr，并发一条 `[foundations:budget]` 消息，让 bot 告诉你并把剩余工作交给 worker。全部可配置项见插件 README。
+
 ```bash
 dsh-bot persona show --data-dir ~/.dsh-bot/profiles/web/session-foundations
 dsh-bot memory list --data-dir ~/.dsh-bot/profiles/web/session-foundations --session ID
