@@ -1,29 +1,19 @@
 {
   "name": "@thready-web/dsh-bot",
-  "version": "0.1.0-beta.0",
+  "version": "0.1.0-beta.5",
   "type": "module",
-  "description": "DSH bot: session persona, memory, work, hash routing, and the workbench. Pinned to @deepseek-ai/dsh 0.2.2-rc.1.",
+  "description": "Out-of-the-box DSH: @deepseek-ai/dsh 0.2.2-rc.1 plus the bot plugin. The workbench stays at /dsh-bot/.",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/thready-web/dsh-bot.git"
   },
   "bin": {
-    "dsh-bot": "./dist/cli.js"
-  },
-  "exports": {
-    ".": "./dist/index.js",
-    "./http": "./dist/http-plugin.js",
-    "./router": "./dist/router-plugin.js",
-    "./client": "./client.js",
-    "./engine": "./dist/engine.js",
-    "./package.json": "./package.json"
+    "dsh-bot": "./bin.js"
   },
   "files": [
-    "dist",
-    "public",
-    "client.js",
-    "fixtures",
+    "bin.js",
+    "lib",
     "README.md"
   ],
   "publishConfig": {
@@ -31,28 +21,14 @@
     "tag": "beta"
   },
   "scripts": {
-    "build": "node build.mjs",
-    "type-check": "tsc -p tsconfig.typecheck.json --noEmit && node type-check-tests.mjs",
-    "test": "node --test test/store.test.ts test/skills.test.ts test/context.test.ts test/tools.test.ts test/triggers.test.ts test/provision.test.ts test/inbox-read.test.ts test/work.test.ts test/work-eval.test.ts test/router.test.ts test/desk.test.ts test/session-files.test.ts test/session-previews.test.ts test/cdc.test.ts test/live-diff.test.ts test/live-snapshot.test.ts ui/src/live.test.ts ui/src/follow.test.ts ui/src/work.test.ts ui/src/session-snapshot.test.ts",
-    "test:host": "npm run build && node --test test/host-integration.test.ts && node --test test/triggers-host.test.ts"
+    "start": "node ./bin.js",
+    "test": "node --test test/launch.test.js"
   },
   "engines": {
-    "node": ">=22.18.0"
+    "node": ">=24.9.0"
   },
-  "devDependencies": {
-    "@types/node": "^24.10.0",
-    "esbuild": "^0.25.0",
-    "typescript": "^5.9.3"
-  },
-  "dsh": {
-    "manifestVersion": 1,
-    "client": {
-      "platform": "web",
-      "immediately": true
-    },
-    "compat": {
-      "package": "@deepseek-ai/dsh",
-      "version": "0.2.2-rc.1"
-    }
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.2.2-rc.1",
+    "@thready-web/dsh-bot-plugin": "0.1.0-beta.0"
   }
 }

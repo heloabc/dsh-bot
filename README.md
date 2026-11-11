@@ -1,45 +1,30 @@
 # @thready-web/dsh-bot
 
-One Cordis package for the DSH bot. Install it into a DSH profile and the bot runs in that process.
-
-| Entry | Role |
-| --- | --- |
-| `@thready-web/dsh-bot` | Persona, memory, skills, work, and inbox |
-| `@thready-web/dsh-bot/http` | `/dsh-bot/api/*` (same routes as `/session-foundations/api/*`) and the workbench at `/dsh-bot/` |
-| `@thready-web/dsh-bot/router` | Hash routing for the official web client |
-
-Prompts, tool descriptions, and API messages are English. A stored persona may still start with a legacy CJK name label. New persona text uses `Name:`, `Style:`, and `Task:`. The workbench defaults to English. The language control switches the whole UI through the message catalog in `ui/src/i18n.ts`.
+Out-of-the-box DSH. This package pins `@deepseek-ai/dsh@0.2.2-rc.1` and inserts `@thready-web/dsh-bot-plugin`. It does not insert the math guard or the Ollama usage panel.
 
 ```bash
-npm install
-npm test
-npm run build
-npm --prefix ui install
-npm --prefix ui run build
+dsh-bot
 ```
 
-DSH itself is not in this repository. Running a host needs `@deepseek-ai/dsh@0.2.2-rc.1` and Node.js `>= 24.9`. Plugin unit tests run on Node `>= 22.18`.
+The official client is <http://127.0.0.1:8787/>. The workbench is <http://127.0.0.1:8787/dsh-bot/>. `DSH_HOME` defaults to `~/.dsh-bot`.
 
-In `cordis.patch.yml` every new entry must be wrapped in `- insert:`:
+Node.js `>= 24.9` is required to start the host. `DSH_NODE` selects that binary when the current Node is older. `DSH_PORT` and `DSH_PROFILE` override the defaults. A flag (`--port`, `--profile`, `--host`, `--home`) overrides the matching variable.
 
-```yaml
-- insert:
-    - id: ui-router
-      name: "@thready-web/dsh-bot/router"
-- insert:
-    - id: session-foundations
-      name: "@thready-web/dsh-bot"
-- insert:
-    - id: session-foundations-http
-      name: "@thready-web/dsh-bot/http"
-```
-
-Start the host with `dsh --profile <name> --host 127.0.0.1 --port <port> --no-open` after the patch lists these entries. The official client is `/`. The workbench is `/dsh-bot/`.
-
-DSH loads `dist/`. Rebuild after changing `src/`. Until `npm --prefix ui run build` has run, `/dsh-bot/` is 404.
-
-Host integration needs Node `>= 24.9` and `DSH_BIN`:
+Admin commands use the same binary:
 
 ```bash
-npm run test:host
+dsh-bot persona show --data-dir DIR
+dsh-bot memory list --data-dir DIR --session ID
+dsh-bot help
 ```
+
+From this repository, build the plugin and the workbench before the first start:
+
+```bash
+npm run build:bot
+npm --prefix plugins/dsh-bot-plugin/ui install
+npm --prefix plugins/dsh-bot-plugin/ui run build
+npx dsh-bot
+```
+
+`npm run dev` at the repository root still starts a profile that also inserts the math guard and the usage panel. That script reads `DSH_BIN` and keeps its data in `.run/dsh-home`.
