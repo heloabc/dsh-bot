@@ -26,7 +26,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       - name: Use an npm CLI that supports trusted publishing
@@ -40,7 +40,8 @@ jobs:
 
       - name: Publish the next 0.1.0 beta
         run: |
-          node .github/next-beta-version.mjs
+          version=$(node .github/next-beta-version.mjs)
+          echo "publishing ${version}"
           # Trusted publishing uses the OIDC token only when NODE_AUTH_TOKEN is unset.
           unset NODE_AUTH_TOKEN
           for attempt in 1 2 3 4 5; do
@@ -50,6 +51,11 @@ jobs:
             set -e
             printf '%s\n' "$log"
             if [ "$code" -eq 0 ]; then
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add package.json package-lock.json
+              git diff --cached --quiet || git commit -m "release: $(node -p 'require(\"./package.json\").version') [skip ci]"
+              git push origin HEAD
               exit 0
             fi
             if ! printf '%s\n' "$log" | grep -q 'E409'; then
