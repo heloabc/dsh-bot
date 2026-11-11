@@ -14,7 +14,8 @@
   "files": [
     "bin.js",
     "lib",
-    "README.md"
+    "README.md",
+    "README.zh-CN.md"
   ],
   "publishConfig": {
     "access": "public",
