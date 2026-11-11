@@ -11,6 +11,7 @@ concurrency:
 
 permissions:
   contents: write
+  packages: write
   id-token: write
 
 jobs:
@@ -18,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      packages: write
       id-token: write
     steps:
       - uses: actions/checkout@v4
@@ -58,12 +60,16 @@ jobs:
           done
           exit 1
 
-      - name: Publish the GitHub release
+      - name: Publish the GitHub package and release
         env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          printf '%s\n' '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' >> .npmrc
+          npm pkg set publishConfig.access=restricted
+          npm publish --registry https://npm.pkg.github.com --access restricted
           version=$(node --input-type=module -e "import {readFileSync} from 'node:fs'; process.stdout.write(JSON.parse(readFileSync('package.json','utf8')).version)")
           gh release create "v${version}" \
             --title "v${version}" \
-            --notes "Beta published to npm as \`@thready-web/dsh-bot@${version}\`." \
+            --notes "Beta published to npm and GitHub Packages as \`@thready-web/dsh-bot@${version}\`." \
             --prerelease
