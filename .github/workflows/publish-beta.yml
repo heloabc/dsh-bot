@@ -1,0 +1,69 @@
+name: Publish beta
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: npm-beta
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Use an npm CLI that supports trusted publishing
+        run: npm install --global npm@^11.5.1
+
+      - name: Install
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Publish the next 0.1.0 beta
+        run: |
+          node .github/next-beta-version.mjs
+          # Trusted publishing uses the OIDC token only when NODE_AUTH_TOKEN is unset.
+          unset NODE_AUTH_TOKEN
+          for attempt in 1 2 3 4 5; do
+            set +e
+            log=$(npm publish --tag beta --access public 2>&1)
+            code=$?
+            set -e
+            printf '%s\n' "$log"
+            if [ "$code" -eq 0 ]; then
+              exit 0
+            fi
+            if ! printf '%s\n' "$log" | grep -q 'E409'; then
+              exit "$code"
+            fi
+            echo "That beta is already staged or published. Trying the next one."
+            node .github/next-beta-version.mjs --bump
+          done
+          exit 1
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(node --input-type=module -e "import {readFileSync} from 'node:fs'; process.stdout.write(JSON.parse(readFileSync('package.json','utf8')).version)")
+          gh release create "v${version}" \
+            --title "v${version}" \
+            --notes "Beta published to npm as \`@thready-web/dsh-bot@${version}\`." \
+            --prerelease
