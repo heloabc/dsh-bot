@@ -62,14 +62,19 @@ if (!plan.ok) {
 }
 
 mkdirSync(plan.home, { recursive: true })
+mkdirSync(plan.workspace, { recursive: true, mode: 0o700 })
 writeFileSync(plan.patchFile, plan.patch)
 console.log(`DSH profile ${plan.profile} on http://${plan.host}:${plan.port}/`)
 console.log(`Workbench http://${plan.host}:${plan.port}/dsh-bot/`)
 console.log(`DSH_HOME ${plan.home}`)
+console.log(`Workspace ${plan.workspace}`)
+if (plan.env.DSH_BOT_WORK_BUDGET) console.log(`Work budget ${plan.env.DSH_BOT_WORK_BUDGET}`)
 
 const child = spawn(plan.node, plan.args, {
+  cwd: plan.workspace,
   env: {
     ...process.env,
+    ...plan.env,
     DSH_HOME: plan.home,
     DSH_TELEMETRY_DISABLED: '1',
   },
